@@ -1,0 +1,432 @@
+# Setup
+
+## Load libraries
+```{r}
+library(dplyr)
+library(reshape)
+library(ggplot2)
+library(GGally)
+library(plotly)
+library(mice) # for imputing
+library(viridis)
+library(hrbrthemes)
+library(purrr)
+library(tidyr)
+library(gganimate)
+```
+
+## Load data 
+```{r}
+data <- readxl::read_excel("data.xlsx")
+head(data)
+# check data type
+glimpse(data)
+# check NaNs
+naniar::gg_miss_var(data, show_pct = T)
+```
+
+## Understand the Data
+```{r}
+count(data, Date) # number of unique dates
+dim(data)
+dim(data)[1] == 365 * 24
+```
+As shown above we have 365 days * 24 hours = 8760 data points.
+Goal: predict number of bikes rented per hour (given info such as day, rainfall, etc.)
+      figure out which factors affect it most
+  
+## Clean data
+Rename variables so they are easier to understand and work with
+Original:
+  Date : year-month-day 
+  Rented Bike count - Count of bikes rented at each hour
+  Hour - Hour of the day
+  Temperature-Temperature in Celsius
+  Humidity - %
+  Windspeed - m/s
+  Visibility - 10m
+  Dew point temperature - Celsius
+  Solar radiation - MJ/m2
+  Rainfall - mm
+  Snowfall - cm
+  Seasons - Winter, Spring, Summer, Autumn
+  Holiday - Holiday/No holiday
+  Functional Day - NoFunc(Non Functional Hours), Fun(Functional hours)
+
+Renamed to:
+  date
+  count
+  hour
+  temp
+  humid
+  wind
+  visib
+  dew
+  solar
+  rain
+  snow
+  season
+  holiday
+  func
+```{r}
+colnames(data) <- c(
+  "date", "count", "hour", "temp", "humid", "wind", "visib",
+  "dew", "solar", "rain", "snow", "season", "holiday", "func"
+)
+attach(data)
+```
+
+Dates have mixed formats. Parse for consistency.  
+```{r}
+# Tried Lubridate but 3456/8470 failed to parse.
+# library(lubridate)
+# parse_date_time(x = data$Date,
+#                 orders = c("y-m-d", "d/m/y"),
+#                 locale = "eng")
+# dplyr::count(data, Date)
+
+# Looked around and found linelist which has a guess_dates() function
+# linelist may not be avail for current version of R
+# if that's the case, install via pacman::p_load_gh("reconhub/linelist")
+data$date <- linelist::guess_dates(data$date)
+count(data, date)
+```
+Now looks good.
+
+Extract day of week (could be a good predictor!)
+```{r}
+# Combine Date and Hour. Order Date variables in front
+data <- data[, c(1, 3, 2, 4:14)]
+data["datetime"] <- as.POSIXct(paste(data$date, data$hour),
+  format = "%Y-%m-%d %H", tz = "Asia/Seoul"
+)
+data <- data[c(15, 1:14)]
+weekday <- lubridate::wday(data$date, label = TRUE)
+data["weekday"] <- weekday
+glimpse(data)
+```
+
+Assign levels to qualitative variables
+```{r}
+# Separate qualitative and quantitative variables
+quant_vars <- c("temp", "humid", "wind", "visib", "dew", "solar", "rain", "snow")
+qual_vars <- c("season", "weekday", "hour", "holiday", "func")
+# change data type to factor
+data[qual_vars] <- lapply(data[qual_vars], factor)
+glimpse(data)
+# print level-to-int mappings
+for (col in data[qual_vars]) {
+  df <- data.frame(levels = unique(col), value = as.numeric(unique(col)))
+  print(df[order(df$value), ])
+}
+# reorder levels
+data$season <- factor(data$season, levels = c("Winter", "Spring", "Summer", "Autumn"))
+data$holiday <- factor(data$holiday, levels = c("No Holiday", "Holiday"))
+data$weekday <- factor(data$weekday, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+# check again
+for (col in data[qual_vars]) {
+  df <- data.frame(levels = unique(col), value = as.numeric(unique(col)))
+  print(df[order(df$value), ])
+}
+# summary statistics
+summary(data)
+str(data)
+```
+
+Other approaches:
+```{r}
+# # cleanest way to do this if we don't care about the order of the mappings
+# out<-data.matrix(data)
+
+# # another way to change string to factor to int (using dplyr)
+# dfFactors <- data %>%
+#   mutate_if(is.character, as.factor)
+# dfFactors <- data %>%
+#   mutate_if(is.factor, as.numeric)
+
+# # Eric's approach:
+
+# # Replace values in Holiday column with 0s and 1s. 0 - No Holiday, 1 - Holiday
+# data[which(data[,"holiday"]=="Holiday"), "holiday"] <- "1"
+# data[which(data[,"holiday"]=="No Holiday"), "holiday"] <- "0"
+# data["holiday"] <- as.integer(unlist(data["holiday"]))
+# # Replace values in Seasons column with values from 0 to 3. 0 - Winter, 1 - Spring, 2 - Summer, 3 - Autumn
+# data[which(data[,"season"]=="Winter"), "season"] <- "0"
+# data[which(data[,"season"]=="Spring"), "season"] <- "1"
+# data[which(data[,"season"]=="Summer"), "season"] <- "2"
+# data[which(data[,"season"]=="Autumn"), "season"] <- "3"
+# data["season"] <- as.integer(unlist(data["season"]))
+# # Replace values in Functioning Day column with values 0s and 1s. 0 - No, 1 - Yes
+# data[which(data[,"func"]=="Yes"), "func"] <- "1"
+# data[which(data[,"func"]=="No"), "func"] <- "0"
+# data["func"] <- as.integer(unlist(data["func"]))
+```
+
+# Time Series Analysis
+The dates are very unevenly spaced. Let's visualize the increments. 
+Let's also see if there's any overarching trends over time. 
+```{r}
+ggplot(data, aes(x = datetime, y = count)) +
+  geom_point(cex = 0.1) +
+  xlab("")
+```
+note/smth to consider: old data should not have as much weight... 
+vanilla regression isn't the best if we're using 2017 data
+why the big jump? anything in the papers she linked?
+
+```{r}
+# get total count per day
+df <- aggregate(data$count, by=list(data$date), sum)
+colnames(df) <- c("date", "daily_count")
+plot(df)
+# get a better view of the increments (varying y values are distracting)
+plot(df$date, rep(1, length(df$date)), cex = 0.1)
+# slice and repeat
+seq <- seq.Date(as.Date("2017-10-01"),as.Date("2019-01-01"),by="day")
+df1 <- df[df$date %in% seq,]
+plot(df1)
+plot(df1$date, rep(1, length(df1$date)), cex = 0.1)
+# could slice off a little more
+seq <- seq.Date(as.Date("2017-12-01"),as.Date("2019-01-01"),by="day")
+df1 <- df[df$date %in% seq,]
+plot(df1)
+plot(df1$date, rep(1, length(df1$date)), cex = 0.1)
+# now looks good 
+# this cutoff gives us a full year of data - 2017-12-12 to 2018-12-11
+summary(df1)
+# slice actual data and save
+data <- data[data$date %in% seq,]
+write.csv(data,"cleaned.csv", row.names = FALSE)
+```
+```{r}
+# let's see how many dates are missing and decide if we want to impute
+seq <- seq.Date(min(df1$date),max(df1$date),by="day")
+dates <- as.data.frame(seq)
+# perform outer join and % missing
+merged <- merge(x = df1, y = dates, by.x = "date", by.y = "seq", all = TRUE)
+NAs <- merged[is.na(merged$daily_count),]
+NAs
+# seems like only the 12th of each month are missing
+nrow(NAs)/nrow(merged)
+# we can impute since it is less than 10%, but first double check with a plot
+# fill NAs with 0
+merged[is.na(merged)] <- 0
+merged
+p <- merged %>%
+  ggplot(aes(x=date, y=daily_count)) +
+    geom_line( color="grey") +
+    geom_point(shape=21, color="black", fill="#69b3a2", size=0.1) +
+    ggtitle("")
+# interactive plot
+ggplotly(p)
+```
+```{r}
+# # impute
+# merged <- merge(x = data, y = dates, by.x = "date", by.y = "seq", all = TRUE)
+# # use predictive mean matching method
+# tempData <- mice(merged,m=1,maxit=20,meth='pmm',seed=500)
+# # visualize imputed data (red = imputed)
+# # 2 separate plots (grouped by magnitude of x range)
+# xyplot(tempData, count ~ temp + humid + dew + visib,
+#        pch=18,
+#        cex=0.5)
+# xyplot(tempData, count ~ wind + solar + rain + snow,
+#        pch=18,
+#        cex=0.5)
+# # quantitative
+# densityplot(tempData,
+#             count ~ temp + humid + wind + visib + dew + solar + rain + snow,
+#             pch=18,
+#             cex=0.5)
+# # qualitative
+# stripplot(tempData,pch=20,cex=0.5)
+# # looks good, let's save
+# # data <- complete(tempData,1)
+# # write.csv(data,"imputed.csv", row.names = FALSE)
+```
+
+
+```{r}
+data["month"] <- lubridate::month(data$datetime, label = TRUE)
+# here you go luke do what you want with it
+```
+
+```{r}
+# visualize response variable
+boxplot(data$count)
+hist(data$count)
+```
+```{r}
+data %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+
+data[, names(data) != "hour"] %>%
+  keep(is.factor) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_bar() + 
+    coord_flip()
+# fix for overlapping labels:
+# https://stackoverflow.com/questions/19567986/overlapping-axis-labels-in-r
+# scale_x_discrete(guide = guide_axis(n.dodge=3))
+```
+
+
+# Univariate Analysis
+
+## Descriptive statistics
+```{r}
+# Descriptive statistics + Histograms
+library(skimr)
+skim(data)
+```
+
+### Boxplots
+
+```{r}
+# select all numeric columns
+dataNumeric <- data[, quant_vars]
+meltData <- melt(as.data.frame((dataNumeric)))
+p <- ggplot(meltData, aes(factor(variable), value, fill = factor(variable))) 
+p + geom_boxplot(width=0.2, color="darkgrey", alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "plasma") + 
+  facet_wrap(~variable, scale="free")
+```
+
+```{r}
+for (x in data[qual_vars]){
+  p <- ggplot(data, aes(x = x, y = count, fill = x)) +  
+  # geom_violin(width=1.2) +
+  geom_boxplot(width=0.2, color="darkgrey", alpha=0.5) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") 
+  print(p)
+}
+for (x in data[qual_vars]){
+  p <- ggplot(data, aes(x = x, y = count, fill = x)) + 
+  geom_violin(width=0.8) +
+  # geom_boxplot(width=0.2, color="darkgrey", alpha=0.5) +
+  scale_fill_viridis(discrete = TRUE, option = "mako")
+  print(p)
+}
+```
+
+### Stripplots
+```{r}
+ggplot(data, aes(x = season, y = count)) +
+  geom_jitter(position = position_dodge(0.5))
+ggplot(data, aes(x = weekday, y = count)) +
+  geom_jitter(position = position_dodge(0.5))
+ggplot(data, aes(x = hour, y = count)) +
+  geom_jitter(position = position_dodge(0.5))
+ggplot(data, aes(x = holiday, y = count)) +
+  geom_jitter(position = position_dodge(0.5))
+ggplot(data, aes(x = func, y = count)) +
+  geom_jitter(position = position_dodge(0.5))
+```
+
+
+## Check for Multicollinearity (Multivariate Analysis)
+
+### Correlation Plots
+```{r}
+library(corrplot)
+corrplot.mixed(cor(data[quant_vars]), order = "AOE")
+```
+
+```{r}
+ggpairs(data[quant_vars], 
+        lower = list(continuous = wrap("points", alpha = 0.3, size=0.1),
+        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box"),
+        combo = wrap("dot", alpha = 0.4, size=0.2) ),
+        title = "Test")
+ggcorr(data[quant_vars], label = TRUE, label_round = 2, label_alpha = TRUE)
+```
+
+```{r}
+lowerFn <- function(data, mapping, ...) {
+  p <- ggplot(data = data, mapping = mapping) +
+    geom_point(color = 'blue', alpha=0.3, size=0.1) +
+    geom_smooth(color = 'black', size=1)
+  p
+}
+g <- ggpairs( 
+  data = data[quant_vars],
+  lower = list(continuous = wrap(lowerFn)),
+  diag = list(continuous = wrap("barDiag", colour = "blue"))
+)
+g + theme(
+  axis.text = element_text(size = 6),
+  axis.title = element_text(size = 6),
+  legend.background = element_rect(fill = "white"),
+  panel.grid.major = element_line(colour = NA),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey95")
+)
+```
+
+
+```{r}
+library(ellipse)
+library(RColorBrewer)
+
+df <- cor(data[quant_vars])
+ 
+# Build a panel of 100 colors with Rcolor Brewer
+my_colors <- rev(brewer.pal(5, "RdYlGn"))
+my_colors <- colorRampPalette(my_colors)(100)
+ 
+# Order the correlation matrix
+ord <- order(df[1, ])
+data_ord <- df[ord, ord]
+plotcorr(data_ord , col=my_colors[data_ord*50+50] , mar=c(1,1,1,1))
+``` 
+```{r}
+ggplot(data, aes(x=temp, y=dew) ) +
+  geom_bin2d(bins = 70) +
+  scale_fill_viridis() +
+  theme_bw()
+```
+```{r}
+# For fun...
+ggplot(data, aes(x=temp, y=dew) ) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon")
+# Area + contour
+ggplot(data, aes(x=temp, y=dew) ) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", colour="white")
+```
+
+
+```{r}
+p <- ggplot(data, aes(hour, count, color = temp)) +
+  geom_point() +
+  theme_bw() +
+  # gganimate specific bits:
+  labs(title = 'Date: {frame_time}', x = 'hour', y = 'count') +
+  transition_time(date) +
+  ease_aes('linear') + 
+  scale_color_gradient2(midpoint=mean(temp), low="blue", mid="white", high="red")
+library(gifski)
+ 
+animate(p, duration = 5, fps = 10, width = 800, height = 500, renderer = gifski_renderer())
+anim_save("gif/test.gif", renderer = gifski_renderer())
+```
+```{r}
+p <- ggplot(data, aes(date, count, color = temp)) +
+  geom_point() +
+  theme_bw() +
+  # gganimate specific bits:
+  labs(title = 'Time: {frame_time}', x = 'date', y = 'count') +
+  transition_time(date) +
+  ease_aes('linear') +
+  scale_color_gradient2(midpoint=mean(temp), low="blue", mid="white", high="red")
+library(gifski)
+ 
+animate(p, duration = 5, fps = 20, width = 600, height = 200, renderer = gifski_renderer())
+anim_save("gif/test1.gif", renderer = gifski_renderer())
+```
+

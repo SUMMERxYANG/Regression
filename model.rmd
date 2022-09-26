@@ -1,0 +1,308 @@
+# Setup
+
+## Load libraries
+```{r}
+library(dplyr)
+library(reshape)
+library(ggplot2)
+library(plotly)
+library(MASS)
+library(leaps)
+library(car)
+library(ggpubr)
+library(olsrr)
+library(knitr)
+set.seed(1004136231)
+```
+
+## Load data 
+```{r}
+data <- read.csv("cleaned.csv")
+df <- subset(data, select = -c(datetime, date))
+attach(df)
+glimpse(df)
+```
+
+## Model-building dataset and Validation dataset
+```{r}
+# Total number of samples
+N <- dim(df)[1]
+split_ratio <- 0.75
+# model-building dataset
+mb_size <- N * split_ratio
+mb_samp <- sample(1:N, mb_size, replace = F)
+mb_set <- df[mb_samp, ]
+head(mb_set)
+# validation dataset
+valid_size <- N - mb_size
+valid_set <- df[-mb_samp, ]
+head(valid_set)
+```
+
+The split_ratio above is defined as $\text{split_ratio}=\frac{\text{size of model-building dataset}}{\text{total number of samples}}$.
+
+# Model Building and Model Selection
+
+## Main Effect Model (no interaction)
+```{r}
+fitAdditive <- lm(count ~ temp + humid + wind + visib + solar
+                         + rain + snow + factor(hour) + factor(season)
+                         + factor(holiday) + factor(func) + factor(weekday), data = mb_set)
+bestFitAdditive <- stepAIC(fitAdditive, direction = "both")
+# lm(formula = mb_y ~ mb_temp + mb_humid + mb_wind + mb_dew + mb_solar + mb_rain + mb_snow + factor(mb_hour) + factor(mb_season) + factor(mb_holiday) + factor(mb_func) + factor(mb_weekday))
+summary(bestFitAdditive)
+``` 
+
+Adjusted R^2: 0.6462 . TODO: Will put all the R^2, other model selection values into a table in model summary
+
+```{r}
+# Model Selection steps summary
+original_model <- replicate(13, "-")
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(original_model, original_model, original_model)
+rownames(ms_summary) <- c("mb_temp", "mb_humid", "mb_wind", "mb_visib", "mb_dew", "mb_solar", "mb_rain", "mb_snow", "mb_hour", "mb_season", "mb_holiday", "mb_func", "mb_weekday")
+colnames(ms_summary) <- c("Step 1", "Step 2", "Step 3")
+ms_summary["mb_wind", "Step 1"] <- "x"
+ms_summary["mb_visib", "Step 2"] <- "x"
+ms_summary["mb_wind", "Step 2"] <- "x"
+ms_summary["mb_visib", "Step 3"] <- "x"
+ms_summary["mb_wind", "Step 3"] <- "x"
+ms_summary["mb_temp", "Step 3"] <- "x"
+ms_summary
+```
+
+From the above table, we can see that 3 steps are performed in the stepwise regression. The predictors wind, visib and temp are dropped in the three steps, respectively.
+
+```{r}
+# Define PRESS function that calculates the PRESS statistics for a model
+PRESS <- function(lm) {
+  # calculate the predictive residuals
+  pr <- residuals(lm)/(1-influence(lm)$hat)
+  # calculate the PRESS statistics
+  PRESS <- sum(pr^2)
+  return(PRESS)
+}
+step_1_model <- lm(count ~ (temp + humid + visib + solar + rain + snow + factor(hour) + factor(season) + factor(holiday) + factor(func) + factor(weekday)), data = mb_set)
+step_2_model <- lm(count ~ (temp + humid + solar + rain + snow + factor(hour) + factor(season) + factor(holiday) + factor(func) + factor(weekday)), data = mb_set)
+# Model selection criteria values for full model
+original <- c(summary(fitAdditive)$r.squared, summary(fitAdditive)$adj.r.squared, ols_mallows_cp(fitAdditive, fitAdditive), AIC(fitAdditive), BIC(fitAdditive), PRESS(fitAdditive))
+# Model selection criteria values for step_1_model
+step1 <- c(summary(step_1_model)$r.squared, summary(step_1_model)$adj.r.squared, ols_mallows_cp(step_1_model, fitAdditive), AIC(step_1_model), BIC(step_1_model), PRESS(step_1_model))
+# Model selection criteria values for step_2_model
+step2 <- c(summary(step_2_model)$r.squared, summary(step_2_model)$adj.r.squared, ols_mallows_cp(step_2_model, fitAdditive), AIC(step_2_model), BIC(step_2_model), PRESS(step_2_model))
+# Model selection criteria values for bestFitAdditive
+final <- c(summary(bestFitAdditive)$r.squared, summary(bestFitAdditive)$adj.r.squared, ols_mallows_cp(bestFitAdditive, fitAdditive), AIC(bestFitAdditive), BIC(bestFitAdditive), PRESS(bestFitAdditive))
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(step1 - original, step2 - step1, final - step2)
+rownames(ms_summary) <- c("R_squared change", "Adjusted_R_squared change", "Mallows_C_p change", "AIC change", "BIC change", "PRESS change")
+colnames(ms_summary) <- c("step1", "step2", "final")
+ms_summary
+```
+
+Observe that
+
+* Step 1 drops the predictor wind. $R^2_{adj}$ increases by approximately $5.21\times10^{-5}$. AIC, BIC and PRESS drop by approximately 1.98, 8.74 and $2.9\times10^{5}$, respectively. This means dropping wind improves the model performance.
+
+* Step 2 drops the predictor visibility. $R^2_{adj}$ increases by approximately $3.37\times10^{-5}$. AIC, BIC and PRESS drop by approximately 1.63, 8.39 and $2.16\times10^{5}$, respectively. This means dropping visibility improves the model.
+
+* Step 3 drops the predictor temperature. Although $R^2_{adj}$ decreases by approximately $4.98\times10^{-5}$. AIC, BIC and PRESS drop by approximately $5.19\times10^{-2}$, 6.81 and $2.64\times10^{5}$, respectively. This means dropping temperature improves the model.
+
+## Interaction Model
+```{r}
+# hour and temp only (best predictors according to the papers)
+fitInteraction <- lm(count ~ (factor(hour) + temp)^2 + humid + wind
+                 + solar + rain + snow + factor(func)
+                  + factor(season) + factor(holiday) + factor(weekday), data = mb_set)
+
+# Quant only
+# lm(formula = mb_y ~ mb_temp + mb_humid + mb_wind + mb_dew + mb_solar +
+#     mb_rain + mb_snow + factor(mb_hour) + factor(mb_season) +
+#     factor(mb_holiday) + factor(mb_func) + factor(mb_weekday) +
+#     mb_temp:mb_humid + mb_temp:mb_wind + mb_temp:mb_solar + mb_temp:mb_rain +
+#     mb_humid:mb_wind + mb_humid:mb_dew + mb_humid:mb_solar +
+#     mb_humid:mb_rain + mb_humid:mb_snow + mb_wind:mb_solar +
+#     mb_wind:mb_rain + mb_wind:mb_snow + mb_dew:mb_solar + mb_dew:mb_rain +
+#     mb_dew:mb_snow + mb_solar:mb_rain + mb_solar:mb_snow)
+# Adj R^2: 0.7
+
+# No mb_hour (best, but hard to interpret)
+# lm(formula = mb_y ~ mb_temp + mb_humid + mb_wind + mb_dew + mb_solar +
+# mb_rain + mb_snow + factor(mb_season) + factor(mb_holiday) +
+# factor(mb_func) + factor(mb_weekday) + factor(mb_hour) +
+# mb_temp:mb_wind + mb_temp:mb_dew + mb_temp:mb_solar + mb_temp:mb_rain +
+# mb_temp:mb_snow + mb_temp:factor(mb_season) + mb_temp:factor(mb_func) +
+# mb_temp:factor(mb_weekday) + mb_humid:mb_dew + mb_humid:mb_solar +
+# mb_humid:mb_rain + mb_humid:factor(mb_season) + mb_humid:factor(mb_holiday) +
+# mb_humid:factor(mb_weekday) + mb_wind:mb_dew + mb_wind:mb_solar +
+# mb_wind:mb_rain + mb_wind:mb_snow + mb_wind:factor(mb_season) +
+# mb_wind:factor(mb_weekday) + mb_dew:mb_solar + mb_dew:mb_rain +
+# mb_dew:factor(mb_season) + mb_dew:factor(mb_func) + mb_dew:factor(mb_weekday) +
+# mb_solar:mb_rain + mb_solar:factor(mb_holiday) + mb_solar:factor(mb_func) +
+# mb_solar:factor(mb_weekday) + mb_rain:factor(mb_weekday) +
+# mb_snow:factor(mb_weekday) + factor(mb_season):factor(mb_holiday) +
+# factor(mb_season):factor(mb_weekday) + factor(mb_holiday):factor(mb_weekday))
+# Adj R^2: 0.7542
+
+# Just hour and temp
+# lm(formula = mb_y ~ mb_temp + factor(mb_hour) + mb_humid + mb_dew +
+#     mb_solar + mb_rain + mb_snow + factor(mb_season) + factor(mb_holiday) +
+#     factor(mb_func) + factor(mb_weekday) + mb_temp:factor(mb_hour))
+# Removed mb_wind
+# Adj R^2: 0.7293
+
+# Maybe try interactions with hour and other stuff. Since hour is quite significant
+# Hour and temperature are the most significant from papers
+
+
+bestFitInteraction <- stepAIC(fitInteraction, direction = "both")
+summary(bestFitInteraction)
+```
+
+## Power Model (interaction + exponents)
+### Added Variable Plots (quantitative only)
+```{r}
+fitQuant <- lm(mb_y ~ (mb_temp + mb_humid + mb_wind + mb_visib + mb_dew + mb_solar + mb_rain + mb_snow))
+ols_plot_added_variable(fitQuant)
+```
+### Model
+Rain and snow look "squished", so let's take the square root for a better fit. Typically the polynomial models only use integer exponents, but we experiment and discover using square root results in a higher adjusted $R^2$. 
+```{r}
+fitPower <- lm(formula = count ~ factor(hour) + temp + humid + solar 
+               + rain + snow + factor(func) + factor(season) + factor(holiday) 
+               + factor(weekday) + factor(hour):temp 
+               + I(snow^(1 / 2)) + I(rain^(1 / 2)), data = mb_set)
+bestFitPower <- stepAIC(fitPower, direction = "both")
+summary(bestFitPower)
+# lm(formula = mb_y ~ factor(mb_hour) + mb_temp + mb_humid + mb_dew +
+# mb_solar + mb_rain + factor(mb_func) + factor(mb_season) +
+# factor(mb_holiday) + factor(mb_weekday) + I(mb_snow^(1/2)) +
+# I(mb_rain^(1/2)) + factor(mb_hour):mb_temp)
+# Adj R^2: 0.7483
+```
+
+The best model obtained from stepwise elimination is
+\[Y=\beta_0+\beta_1\cdot\text{temp}+\beta_2\cdot\text{humid}+\beta_3\cdot\text{dew}+\beta_4\cdot\text{solar}+\beta_5\cdot\text{snow}+\beta_6\cdot\text{rain}+\beta_7\cdot\text{snow}^{\frac{1}{2}}+\beta_8\cdot\text{rain}^{\frac{1}{2}}+\sum_{i=0}^{23}\beta_{i+9}D_i+\sum_{i=0}^{23}\beta_{i+33}D_{i+24}\]
+
+## Model Summary
+```{r}
+# Model selection criteria values for bestFitAdditive model
+cri1 <- c(summary(bestFitAdditive)$r.squared, summary(bestFitAdditive)$adj.r.squared, ols_mallows_cp(bestFitAdditive, fitAdditive), AIC(bestFitAdditive), BIC(bestFitAdditive), PRESS(bestFitAdditive))
+# Model selection criteria values for bestFitInteraction model
+cri2 <- c(summary(bestFitInteraction)$r.squared, summary(bestFitInteraction)$adj.r.squared, ols_mallows_cp(bestFitInteraction, fitInteraction), AIC(bestFitInteraction), BIC(bestFitInteraction), PRESS(bestFitInteraction))
+# Model selection criteria values for bestFitPower model
+cri3 <- c(summary(bestFitPower)$r.squared, summary(bestFitPower)$adj.r.squared, ols_mallows_cp(bestFitPower, fitPower), AIC(bestFitPower), BIC(bestFitPower), PRESS(bestFitPower))
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(cri1, cri2, cri3)
+rownames(ms_summary) <- c("R_squared", "Adjusted_R_squared", "Mallows_C_p", "AIC", "BIC", "PRESS")
+colnames(ms_summary) <- c("bestFitAdditive", "bestFitInteraction", "bestFitPower")
+ms_summary
+```
+Observe from the above table, the bestFitPower model has the highest $R^2$ ana $R^2_{adj}$, and the lowest AIC, BIC and PRESS. Therefore, we will choose bestFitPower as our final model.
+
+## Final Model
+The following is a summary of the final model for predicting rental bike count.
+```{r}
+final_model = bestFitPower
+summary(final_model)
+```
+Observe that the p-value for F-statistic is less than $2.2\times10^{-16}$. Since it is much smaller than $0.01$, we reject the null hypothesis that all the coefficients are 0 with $99\%$ confidence. Here is the top 15 significant predictors from our final model (from left to right):
+```{r message=FALSE, echo=FALSE}
+# Make a summary table for the p-value for t-statistics of coefficients
+unsorted_data <- data.frame(summary(final_model)$coefficients[,4])
+pvalue_data <- data.frame(unsorted_data[order(unsorted_data[,1]),])
+pvalue_data <- c("6.023259e-272", "3.146954e-96", "4.902086e-73", "2.454797e-38", "3.184070e-30",
+                 "3.438887e-28", "6.036245e-28", "5.209009e-26", "7.468217e-24", "4.361069e-22",
+                 "7.029520e-22", "8.319585e-21", "1.012080e-17", "1.172648e-14", "1.483364e-12")
+coefficient_data <- c(884.8573, -380.9353, -475.2298, -156.5091, 28.1940, 27.4383,
+                     27.7041, 412.2179, 113.6037, 24.0440, -149.6061, 73.2413, 377.2912, 
+                     19.4463, -6.5916)
+pvalue_summary <- data.frame(pvalue_data, coefficient_data)
+colnames(pvalue_summary) <- c("p-value", "Coefficient")
+rownames(pvalue_summary) <- c("Functioning Day (Yes)", "Seasons (Winter)",
+"Rainfall^(1/2))", "Seasons (Spring)", "Hour 6pm:Temperature",
+"Hour 7pm:Temperature", "Hour 8pm:Temperature", "Hour 8am", 
+"Solar Radiation", "Hour 9pm:Temperature", "Seasons (Summer)", "Rainfall",
+"Hour 6pm", "Hour 22pm:Temperature", "Humidity")
+kable(pvalue_summary)
+```
+
+The above table indicates what predictors are significant in the final model. Here we give interpretation for some of the significant predictors. For example, the predictor Winter has a very small p-value $3.15\times10^{-96}$ and is therefore a significant predictor. We can see that the coefficient for Winter in the final model is $-380.94$. This means that the rental bike count will decrease by around 381 units on average when it is winter compared to other seasons while holding all other variables constant. This agrees with our common sense because people usually don't ride bikes in winter because of the bad weather conditions. Also, the predictors 8am and interaction terms between temperature and 6pm, 7pm, 8pm are all significant predictors. This means that rental bike count changes significantly at 8am. This agrees with the great jump of rental bike count at 8am in the correlation plot of rental bike count and hour in EDA section. The coefficient of this time spot is $412.22$. This means the rental bike count will increase by around 412 units on average when it is 8am compared to other hour while holding all other variables constant. The fact that the interaction terms between temperature and 6pm, 7pm and 8pm are significant means that there are significant slope differences for predictor temperature between the regression line for 6pm/7pm/8pm and 12am (base category) while holding all other variables constant. For instance, the coefficient for the interaction term between 6pm and tempearture is $28.19$. This means that the slope of temperature is around 28.19 higher when it is 6pm compared to 12am. The last example is Solar Radiation. It has a coefficient $113.60$ which means a unit increase in solar radiation will result in around 114 units increase in rental bike count nets of effect from $\text{solar}^\frac{1}{2}$ and all other variables. 
+
+
+Also, notice that $\frac{1}{3}$ of the 15 significant predictors are interaction terms between temperature and hour. This agree with the reference paper.
+
+### Model Validation
+Here we use MSPR statistic to validate the model performance.
+```{r}
+pred.cv.out <- predict(final_model, valid_set)
+delta.cv.out <- valid_y - pred.cv.out
+n.star <- dim(valid_set)[1]
+MSPR <- sum((delta.cv.out)^2)/n.star
+validation_summary <- data.frame(MSPR, MSE_F)
+rownames(validation_summary) <- "Validation Statistics"
+colnames(validation_summary) <- c("MSPR", "MSE_F")
+kable(validation_summary)
+```
+Observe that MSPR is very close to MSE of the training model. This means that the model pass the validation test.
+
+### Model Diagnostics
+
+#### Influential Measures of bestFitPower
+
+```{r}
+#model_inf <- influence.measures(bestFitPower);
+#model_inf
+```
+
+#### Residual Diagnostics
+
+```{r}
+#Added variable plots:
+#ols_plot_added_variable(bestFitPower)
+
+#Cook's Distance:
+p1 <- ols_plot_cooksd_chart(fitPower)
+#DFBETAS:
+#ols_plot_dfbetas(fitPower)
+#DIFFITS:
+p2 <- ols_plot_dffits(fitPower)
+#Standardized residual vs leverage:
+p3 <- ols_plot_resid_lev(fitPower)
+#Studentized deleted residual vs predicted values:
+p4 <- ols_plot_resid_stud_fit(fitPower)
+
+ggarrange(p1, p2, p3, p4, ncol = 1, nrow = 2)
+
+```
+
+#### Remove influential points and retrain data
+
+```{r}
+inf_pts <- p2$data$obs[abs(p2$data$dbetas) > 0.2]
+mb_set_infpts_removed <- mb_set[-inf_pts,]
+
+fitPower_infpts_removed <- lm(formula = count ~ factor(hour) + temp + humid + solar  + rain + snow + factor(func) + factor(season) + factor(holiday)  + factor(weekday) + factor(hour):temp + I(snow^(1 / 2)) + I(rain^(1 / 2)), data = mb_set_infpts_removed)
+bestFitPowerInfptsRemoved <- stepAIC(fitPower_infpts_removed, direction = "both")
+summary(bestFitPowerInfptsRemoved)
+
+```
+
+
+#### Check for Multicollinearity:
+
+```{r}
+VIF <- vif(fitPower)
+VIF
+VIF_bar <- mean(vif(fitPower))
+VIF_bar
+
+```
+
+#### LINE assumptions:
+
+```{r}
+par(mfrow=c(2,2))
+plot(fitPower, which = c(1,2,3))
+plot(order(fitted(fitPower)), resid(fitPower), ylab = "Residuals", xlab = "Observation", main = "Residuals vs Observation")
+
+```

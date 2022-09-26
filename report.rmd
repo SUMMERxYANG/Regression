@@ -1,0 +1,634 @@
+---
+title: \vspace{3.5in} Predicting Bike-Share Demand
+date: "`r Sys.Date()`"
+output: 
+    pdf_document:
+        fig_caption: true
+        number_sections: true
+        citation_package : biblatex
+    html_document:
+      toc : TRUE
+bibliography: references.bib
+---
+
+Summer Yang - Exploratory Data Analysis
+
+Luke Zhang - Model Building
+
+Zhiquan Cui - Model Validation
+
+Farin Hossain - Model Validation
+
+\newpage 
+\tableofcontents
+\newpage
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(out.width = "50%", echo=FALSE, warning=FALSE, message=FALSE)
+```
+```{r setup, include=FALSE}
+# include = FALSE: nothing will be shown
+# echo = FALSE: code won't be shown but output will be
+# results = FALSE: code will be shown but output won't be
+library(reshape)
+library(plotly)
+library(mice)
+library(MASS)
+library(leaps)
+library(car)
+library(ggpubr)
+library(olsrr)
+library(knitr)
+library(ggplot2)
+library(viridis)
+library(reshape); library(dplyr)
+library(GGally)
+library(purrr); library(tidyr)
+library(ellipse); library(RColorBrewer)
+set.seed(1004136231)
+```
+
+# Introduction
+## Seoul Bike Sharing Demand
+Over the years, cycling has grown in popularity which is not surprising as the world is becoming urbanized at an accelerated rate with already a majority of the world living in urban areas (@UN, @Paton). Currently, about 1,000 cities around the world have a bike sharing program (@Gutman). One of which includes Seoul’s Ddareungi, or Seoul Bike, with over 37500 bikes (@Seoul). 
+
+There are many benefits to bike sharing and similar micro mobility programs such as reductions in vehicle emissions, fuel consumption, traffic congestion as well as fostering transit flexibility, physical activity, and financial savings. Not only are there many benefits for the citizens, but it saves public health dollars due to less traffic accidents (@Clockston). Some popular bike shares include BIXI in Montreal, Mobike in China, Lime in California, and Bike Share Toronto. Although it seems a rosy picture, research shows there can be issues with under use, so it poses a problem of finding the balance for supply and demand (@Elliot). 
+
+Conveniently, Seoul has provided a dataset of 8760 data points spanning 2017 and 2018 and we will use this to drive a solution to this problem. Our goal is to identify significant predictors for bike rentals and obtain the best least squares regression model to forecast the bike counts for future years.
+
+
+## Hypothesis
+We hypothesize the significant predictors are hour, temperature, season, functional day, and holiday. In short, we theorize more bikes will be rented around 9am and 5pm, on a warmer, functioning day that is not a holiday.
+
+Hour - Hour of the day
+Since people generally go outside during the daytime, more bikes would be rented 
+during the day, so we can expect to see a correlation between the hour of the day 
+and bikes rented. However, this correlation might not be linear since we can 
+expect that there will be increases in bike rentals in the morning as people ride 
+to work, and in the afternoon when they go home. Because of this we make hour qualitative
+
+Temperature - Temperature in Celsius
+Temperature would likely have a positive linear correlation with the number of 
+bike rentals, since people are more likely to go outside when the weather is 
+nice, and when they are outside they may decide to ride a bike to enjoy the 
+weather. So as the temperature drops at night or during wintertime, there likely 
+would not be many bike rentals compared to the number of rentals during warmer 
+temperatures. So we expect that as temperature increases, the number of bikes 
+rented will increase as well.
+
+Holiday - Holiday/No holiday
+Whether or not it is a holiday may have a strong correlation with the number of 
+bike rentals, since those who bike to school or work would not rent bikes during 
+holidays, so bike rentals during holidays should be lower than non-holidays.
+
+Functional Day - NoFunc(Non Functional Hours), Fun(Functional hours)
+Functional Day would likely have a strong correlation with bike usage in Seoul, 
+since many people ride their bikes to school or work during functional hours, so 
+we expect to see an increase in the number of bike rentals during functional 
+hours for that reason.
+
+
+# Data Description
+## Data Preparation
+We began EDA by verifying that the data set does not contain missing values.
+```{r}
+data <- readxl::read_excel("data.xlsx")
+# check datatypes
+# glimpse(data)
+# check missing values
+naniar::gg_miss_var(data, show_pct = T)
+```
+
+Next, we renamed the variables so that they are easier to work with. 
+```{r, include = TRUE, echo = TRUE}
+colnames(data) <- c(
+  "date", "count", "hour", "temp", "humid", "wind", "visib",
+  "dew", "solar", "rain", "snow", "season", "holiday", "func"
+)
+```
+
+We speculated that the day of week could be a good predictor. But in order to extract
+it from the dates, we need to first parse the dates column.
+We noticed that different date formats (such as "yyyy-mm-dd" and "dd/mm/yyyy") were used.
+Using the linelist package, we converted the column from strings to datetime.
+```{r}
+attach(data)
+data$date <- linelist::guess_dates(data$date)
+# Combine Date and Hour. Order Date variables in front
+data <- data[, c(1, 3, 2, 4:14)]
+data["datetime"] <- as.POSIXct(paste(data$date, data$hour),
+  format = "%Y-%m-%d %H", tz = "Asia/Seoul"
+)
+data <- data[c(15, 1:14)]
+# extract day of week
+weekday <- lubridate::wday(data$date, label = TRUE)
+data["weekday"] <- weekday
+```
+We then corrected the data types for the other columns, casting 
+["temp", "humid", "wind", "visib", "dew", "solar", "rain", "snow"] to numeric, and
+["season", "weekday", "hour", "holiday", "func"] to factor.
+```{r}
+# separate qualitative and quantitative variables
+quant_vars <- c("temp", "humid", "wind", "visib", "dew", "solar", "rain", "snow")
+qual_vars <- c("season", "weekday", "hour", "holiday", "func")
+# change data type to factor
+data[qual_vars] <- lapply(data[qual_vars], factor)
+# reorder levels
+data$season <- factor(data$season, levels = c("Winter", "Spring", "Summer", "Autumn"))
+data$holiday <- factor(data$holiday, levels = c("No Holiday", "Holiday"))
+data$weekday <- factor(data$weekday, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+# print level-to-int mappings
+# for (col in data[qual_vars]) {
+#   df <- data.frame(levels = unique(col), value = as.numeric(unique(col)))
+#   print(df[order(df$value), ])
+# }
+```
+We made sure that each date is associated with 24 data points:
+```{r, include = TRUE, echo = TRUE}
+# get number of points for each date
+unique <- count(data, date)
+dim(data)[1]
+dim(unique)[1]
+dim(data)[1] == dim(unique)[1] * 24
+```
+We thus have 365 days * 24 points/day = 8760 data points. However, we still need to 
+ensure that the dates are evenly spaced, i.e. the time increments are consistent.
+We plotted the time series with the response variable (count) on the y axis.
+```{r}
+ggplot(data, aes(x = datetime, y = count)) +
+  geom_point(cex = 0.1) +
+  xlab("") + 
+  theme_bw()
+```
+
+From this, we noticed two problems: 
+
+1. Older data points (2017) have larger increments than those in 2018
+2. More importantly, there is a large jump in magnitude starting in 2018.
+
+We investigated problem 2 by decluttering the plot, visualizing the total count per 
+day instead of all hourly counts. 
+We investigated problem 1 by visualizing the increments without the distraction of differing
+y values.
+```{r}
+df <- aggregate(data$count, by=list(data$date), sum)
+colnames(df) <- c("date", "daily_count")
+plot(df, xlab = "")
+plot(df$date, rep(1, length(df$date)), cex = 0.1, ylab = "", xlab = "", yaxt='n')
+```
+
+This seems like a data problem - perhaps more data was collected nearing the end of 2017
+and at a higher frequency. We also notice gaps in the data collected in 2018.
+
+We searched for an explanation for the disparity, but were unable to find one. 
+Since we are working with time series data to model future demand, older data should not
+hold as much weight as more recent data. Thus, we decided to slice the data.
+```{r}
+seq <- seq.Date(as.Date("2017-12-01"),as.Date("2019-01-01"),by="day")
+df1 <- df[df$date %in% seq,]
+plot(df1, xlab = "")
+plot(df1$date, rep(1, length(df1$date)), cex = 0.1, ylab = "", xlab = "", yaxt='n')
+data <- data[data$date %in% seq,]
+# summary(df1) # new date range: 2017-12-12 to 2018-12-11
+```
+
+Upon slicing, the new date range we are working with is 2017-12-12 to 2018-12-11.
+The increments are now much more consistent, and we have eliminated the disparity.
+We then investigated the gaps in 2018 data. 
+```{r}
+seq <- seq.Date(min(df1$date),max(df1$date),by="day")
+dates <- as.data.frame(seq)
+# perform outer join and compute % missing
+merged <- merge(x = df1, y = dates, by.x = "date", by.y = "seq", all = TRUE)
+NAs <- merged[is.na(merged$daily_count),]
+NAs 
+# seems like only the 12th of each month are missing
+# nrow(NAs)/nrow(merged)
+```
+
+We found that the 12th of each month are missing. Since they only make up 3% of the data,
+imputing seems to be a reasonable approach. However, since we would need to populate 24 
+consecutive rows at a time, the usual methods of imputation (e.g. predictive mean approach)
+are not applicable. We thus chose to ignore the missing dates. 
+
+
+## EDA Results
+
+Summary statistics
+```{r}
+summary(data)
+```
+
+Histograms of quantitative and qualitative variables
+```{r}
+data %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram() + 
+    theme_light()
+
+data[, names(data) != "hour"] %>%
+  keep(is.factor) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_bar() + 
+    coord_flip() + 
+    theme_light()
+```
+
+Box plots & violin plots
+```{r}
+dataNumeric <- dplyr::select_if(data, is.numeric)
+meltData <- melt(as.data.frame((dataNumeric)))
+ggplot(meltData, aes(factor(variable), value, fill = factor(variable))) +
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey", alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "plasma") + 
+  facet_wrap(~variable, scale="free") +
+  xlab("quantitative variables") +
+  ylab("count") + 
+  theme_light()
+
+ggplot(data, aes(x = season, y = count, fill = season)) + 
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey",  alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") + 
+  theme_light() 
+
+ggplot(data, aes(x = weekday, y = count, fill = weekday)) + 
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey",  alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") + 
+  theme_light() 
+
+ggplot(data, aes(x = hour, y = count, fill = hour)) + 
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey",  alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") + 
+  theme_light() 
+
+ggplot(data, aes(x = holiday, y = count, fill = holiday)) + 
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey",  alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") + 
+  theme_light()
+
+ggplot(data, aes(x = func, y = count, fill = func)) + 
+  geom_violin(width=0.8) +
+  geom_boxplot(width=0.2, color="darkgrey",  alpha=0.75) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") + 
+  theme_light()
+```
+
+Correlation plots
+```{r}
+# ggcorr(data[quant_vars], label = TRUE, label_round = 2, label_alpha = TRUE)
+lowerFn <- function(data, mapping, ...) {
+  p <- ggplot(data = data, mapping = mapping) +
+    geom_point(color = '#6eb9db', alpha=0.3, size=0.1) +
+    geom_smooth(color = 'black', size=1)
+  p
+}
+g <- ggpairs( 
+  data = data[quant_vars],
+  lower = list(continuous = wrap(lowerFn)),
+  diag = list(continuous = wrap("barDiag", colour = "#6eb9db"))
+)
+g + theme(
+  axis.text = element_text(size = 6),
+  axis.title = element_text(size = 6),
+  legend.background = element_rect(fill = "white"),
+  panel.grid.major = element_line(colour = NA),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey95")
+)
+
+ggplot(data, aes(x=temp, y=dew) ) +
+  geom_bin2d(bins = 70) +
+  scale_fill_continuous(type = "viridis") +
+  theme_light()
+```
+
+The variables temp and dew seem to have a strong positive correlation (0.9). So we remove dew from the model
+```{r}
+# df <- cor(data[quant_vars]) 
+# # Build a panel of 100 colors with Rcolor Brewer
+# my_colors <- rev(brewer.pal(5, "RdYlGn"))
+# my_colors <- colorRampPalette(my_colors)(100) 
+# # Order the correlation matrix
+# ord <- order(df[1, ])
+# data_ord <- df[ord, ord]
+# plotcorr(data_ord , col=my_colors[data_ord*50+50] , mar=c(1,1,1,1))
+# "Zooming" into temp vs dew (2D density plot)
+
+```
+
+# Analysis 
+## Model Building
+### Preparation of Model-building dataset and Validation dataset
+Since we have completed Exploratory Data Analysis (EDA) and data cleaning, we can now prepare model-building dataset and validation dataset for building a model that predicts the rental bike counts.
+```{r}
+# read the clean data
+data <- read.csv("cleaned.csv")
+df <- subset(data, select = -c(datetime, date))
+```
+
+Now we split the clean data into model-building dataset and validation dataset. The split ratio is defined as the number of samples in model-building dataset divided by the number of samples in clean dataset. Here, the split ratio is chosen to be $0.75$.
+
+```{r}
+# Total number of samples
+N <- dim(df)[1]
+split_ratio <- 0.75
+# model-building dataset
+mb_size <- N * split_ratio
+mb_samp <- sample(1:N, mb_size, replace = F)
+mb_set <- df[mb_samp, ]
+# validation dataset
+valid_size <- N - mb_size
+valid_set <- df[-mb_samp, ]
+# Response Variable
+mb_y <- mb_set$count
+valid_y <- valid_set$count
+```
+
+### Model Selection
+
+#### Main Effect Model
+Notice that there are 12 predictors in this dataset. Seven of them are qualitative variables: Hour, Rainfall, Snowfall, Seasons, Holiday, Functioning Day and Week days. Five of them are quantitative variables: Temperature, Humidity, Wind Speed, Visibility, and Solar Radiation. We will build a parsimonious model that presents the best prediction performance while using the least possible number of predictors.
+
+First, we will try to build a Main Effect Model. Here, we use Stepwise Regression with AIC to simplify the model without impacting much on the performance.
+```{r}
+fitAdditive <- lm(count ~ temp + humid + wind + visib + solar
+                         + rain + snow + factor(hour) + factor(season)
+                         + factor(holiday) + factor(func) + factor(weekday), data = mb_set)
+bestFitAdditive <- stepAIC(fitAdditive, direction = "both", trace = 0)
+```
+The following table shows which variables are dropped at each step in the stepwise regression.
+```{r echo=FALSE}
+# Model Selection steps summary
+original_model <- replicate(12, "-")
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(original_model, original_model, original_model)
+rownames(ms_summary) <- c("Temperature", "Humidity", "Wind", "Visibility",  "Solar Radiation", "Rainfall", "Snowfall", "Hour", "Seasons", "Holiday", "Functioning Day", "Week days")
+colnames(ms_summary) <- c("Step 1", "Step 2", "Step 3")
+ms_summary["Wind", 1:3] <- "x"
+ms_summary["Visibility", 2:3] <- "x"
+ms_summary["Temperature", 3] <- "x"
+kable(ms_summary)
+```
+The following table shows how the model selection criteria values change after each step in stepwise regression.
+```{r echo = FALSE}
+# Define PRESS function that calculates the PRESS statistics for a model
+PRESS <- function(lm) {
+  # calculate the predictive residuals
+  pr <- residuals(lm)/(1-influence(lm)$hat)
+  # calculate the PRESS statistics
+  PRESS <- sum(pr^2)
+  return(PRESS)
+}
+step_1_model <- lm(count ~ (temp + humid + visib + solar + rain + snow + factor(hour) + factor(season) + factor(holiday) + factor(func) + factor(weekday)), data = mb_set)
+step_2_model <- lm(count ~ (temp + humid + solar + rain + snow + factor(hour) + factor(season) + factor(holiday) + factor(func) + factor(weekday)), data = mb_set)
+# Model selection criteria values for full model
+original <- c(summary(fitAdditive)$r.squared, summary(fitAdditive)$adj.r.squared, ols_mallows_cp(fitAdditive, fitAdditive), AIC(fitAdditive), BIC(fitAdditive), PRESS(fitAdditive))
+# Model selection criteria values for step_1_model
+step1 <- c(summary(step_1_model)$r.squared, summary(step_1_model)$adj.r.squared, ols_mallows_cp(step_1_model, fitAdditive), AIC(step_1_model), BIC(step_1_model), PRESS(step_1_model))
+# Model selection criteria values for step_2_model
+step2 <- c(summary(step_2_model)$r.squared, summary(step_2_model)$adj.r.squared, ols_mallows_cp(step_2_model, fitAdditive), AIC(step_2_model), BIC(step_2_model), PRESS(step_2_model))
+# Model selection criteria values for bestFitAdditive
+final <- c(summary(bestFitAdditive)$r.squared, summary(bestFitAdditive)$adj.r.squared, ols_mallows_cp(bestFitAdditive, fitAdditive), AIC(bestFitAdditive), BIC(bestFitAdditive), PRESS(bestFitAdditive))
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(step1 - original, step2 - step1, final - step2)
+rownames(ms_summary) <- c("R_squared change", "Adjusted_R_squared change", "Mallows_C_p change", "AIC change", "BIC change", "PRESS change")
+colnames(ms_summary) <- c("step1", "step2", "final")
+kable(ms_summary)
+```
+Observe that Step 1 drops the predictor wind. $R^2_{adj}$ increases by approximately $5.21\times10^{-5}$. AIC, BIC and PRESS drop by approximately 1.98, 8.74 and $2.9\times10^{5}$, respectively. This means dropping wind improves the model performance. Step 2 drops the predictor visibility. $R^2_{adj}$ increases by approximately $3.37\times10^{-5}$. AIC, BIC and PRESS drop by approximately 1.63, 8.39 and $2.16\times10^{5}$, respectively. This means dropping visibility improves the model. Step 3 drops the predictor temperature. Although $R^2_{adj}$ decreases by approximately $4.98\times10^{-5}$. AIC, BIC and PRESS drop by approximately $5.19\times10^{-2}$, 6.81 and $2.64\times10^{5}$, respectively. This means dropping temperature improves the model.
+
+Here is a summary of the optimal main effect model returned by Stepwise Regression. Notice that the $R^2_{adj}=0.663$ which means $66.3\%$ of variation in rental bike counts can be explained by our main effect model.
+```{r echo=FALSE}
+mem_summary <- data.frame(length(coef(bestFitAdditive)),
+                          summary(bestFitAdditive)$r.squared,
+                          summary(bestFitAdditive)$adj.r.squared,
+                          summary(bestFitAdditive)$fstatistic[1],
+                          anova(bestFitAdditive)["Residuals", "Mean Sq"])
+colnames(mem_summary) <- c("Number of Predictors", "R_squared",
+                           "Adjusted R_squared", "F-stastistics", "MSE")
+rownames(mem_summary) <- "Main Effect Model"
+kable(mem_summary)
+```
+#### Interaction Model
+Now let's add interactions between predictors to see if we can obtain a better model. After considering all interactions, we find the interaction between hour and temperature to have the most impact on predicting power while still keeping the number of predictors relatively low. 
+```{r}
+fitInteraction <- lm(count ~ (factor(hour) + temp)^2 + humid + wind
+                   + solar + rain + snow + factor(func)
+                  + factor(season) + factor(holiday) + factor(weekday), data = mb_set)
+bestFitInteraction <- stepAIC(fitInteraction, direction = "both", trace = 0)
+```
+The Stepwise Regression only iterates once and drops the predictor Snowfall. The following table shows how the model selection criteria values change after applying Stepwise Regression.
+```{r echo = FALSE}
+# Model selection criteria values for full model
+original <- c(summary(fitInteraction)$r.squared, summary(fitInteraction)$adj.r.squared, ols_mallows_cp(fitInteraction, fitInteraction), AIC(fitInteraction), BIC(fitInteraction), PRESS(fitInteraction))
+# Model selection criteria values for bestFitAdditive
+final <- c(summary(bestFitInteraction)$r.squared, summary(bestFitInteraction)$adj.r.squared, ols_mallows_cp(bestFitInteraction, fitInteraction), AIC(bestFitInteraction), BIC(bestFitInteraction), PRESS(bestFitInteraction))
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(final - original)
+rownames(ms_summary) <- c("R_squared change", "Adjusted_R_squared change", "Mallows_C_p change", "AIC change", "BIC change", "PRESS change")
+colnames(ms_summary) <- c("Final Model with Interaction")
+kable(ms_summary)
+```
+
+Here is a summary of the optimal interaction model returned by Stepwise Regression. Notice that $R^2_{adj}\approx0.73$ which means approximately $73\%$ of changes in rental bike counts can be explained by this model. This $R^2_{adj}$ is higher than that of the main effect model which means it can predict the rental bike data better.
+```{r}
+mem_summary <- data.frame(length(coef(bestFitInteraction)),
+                          summary(bestFitInteraction)$r.squared,
+                          summary(bestFitInteraction)$adj.r.squared,
+                          summary(bestFitInteraction)$fstatistic[1],
+                          anova(bestFitInteraction)["Residuals", "Mean Sq"])
+colnames(mem_summary) <- c("Number of Predictors", "R_squared",
+                           "Adjusted R_squared", "F-stastistics", "MSE")
+rownames(mem_summary) <- "Final Model with Interaction"
+kable(mem_summary)
+```
+
+#### Power Model
+First, let's look at the added variable plots that shows the relationship between rental bike counts and each of the predictors that excludes the influence of all other predictors. 
+```{r echo=FALSE, message=FALSE, fig.keep='all'}
+par(mfrow=c(2,2))
+fitQuant <- lm(count ~ (temp + humid + wind + visib + solar + rain + snow), data = mb_set)
+car::avPlots(fitQuant, layout=c(2,4), col.lines='red', grid=TRUE)
+```
+
+Consider the snow and rain AV plots. Both have most of their data points squished around x=0, so we reason to increase the variability of these two predictors by applying a square root transformation. 
+
+```{r}
+fitPower <- lm(formula = count ~ factor(hour) + temp + humid + solar 
+               + rain + snow + factor(func) + factor(season) + factor(holiday) 
+               + factor(weekday) + factor(hour):temp 
+               + I(snow^(1 / 2)) + I(rain^(1 / 2)), data = mb_set)
+bestFitPower <- stepAIC(fitPower, direction = "both", trace = 0)
+```
+Notice that none of the predictors are dropped in the Stepwise Regression. This indicates that each of these predictors are significant, and dropping any of them will harm the model performance. Here is a summary of the power model returned by Stepwise Regression. Notice that $R^2_{adj}\approx0.74$ which means approximately $74\%$ of changes in rental bike counts can be explained by this model. This $R^2_{adj}$ is higher than those of the main effect model and interaction model. This means it is the best model we obtain.
+```{r}
+mem_summary <- data.frame(length(coef(bestFitPower)),
+                          summary(bestFitPower)$r.squared,
+                          summary(bestFitPower)$adj.r.squared,
+                          summary(bestFitPower)$fstatistic[1],
+                          anova(bestFitPower)["Residuals", "Mean Sq"])
+colnames(mem_summary) <- c("Number of Predictors", "R_squared",
+                           "Adjusted R_squared", "F-stastistics", "MSE")
+rownames(mem_summary) <- "Power Model"
+kable(mem_summary)
+```
+Now, let's conduct an F-test to see if all the new terms added in power model are all significant compared to the main effect model.
+$H_0:\text{all the coefficients of new terms in power model compared to main effect model are 0}$
+$H_a: \text{at least one of the coefficients of new terms in power model compared to main effect model is not 0}$
+```{r echo=FALSE}
+SSE_R <- sum(bestFitAdditive$residuals^2)
+SSE_F <- sum(bestFitPower$residuals^2)
+MSE_F <- SSE_F/bestFitPower$df.residual
+F_stat <- ((SSE_R - SSE_F)/(bestFitAdditive$df.residual - bestFitPower$df.residual))/MSE_F
+F_test_summary <- data.frame(SSE_R, SSE_F, bestFitAdditive$df.residual, bestFitPower$df.residual, MSE_F, F_stat)
+colnames(F_test_summary) <- c("SSE_R", "SSE_F", "DF_R", "DF_F", "MSE_F", "F*")
+rownames(F_test_summary) <- "Statistics"
+kable(F_test_summary)
+```
+The F-statistic is calculated using the formula \[F^*=\frac{\frac{SSE_R-SSE_F}{df_R-df_F}}{MSE_R}\]
+```{r results='hide'}
+1-pf(82.58829, df1=23, df2=6307)
+```
+
+Since $p-value=1-pf(82.58829; df_1=23, df_2=6307)\approx0$, we reject the null hypothesis. Hence, all the additional terms in power model are important predictors of rental bike count.
+
+## Final Model
+```{r}
+# Model selection criteria values for Main Effect model
+cri1 <- c(summary(bestFitAdditive)$r.squared, summary(bestFitAdditive)$adj.r.squared,
+          ols_mallows_cp(bestFitAdditive, fitAdditive), AIC(bestFitAdditive), BIC(bestFitAdditive), PRESS(bestFitAdditive))
+# Model selection criteria values for Interaction model
+cri2 <- c(summary(bestFitInteraction)$r.squared, summary(bestFitInteraction)$adj.r.squared,
+          ols_mallows_cp(bestFitInteraction, fitInteraction), AIC(bestFitInteraction), BIC(bestFitInteraction), PRESS(bestFitInteraction))
+# Model selection criteria values for Power model
+cri3 <- c(summary(bestFitPower)$r.squared, summary(bestFitPower)$adj.r.squared,
+          ols_mallows_cp(bestFitPower, fitPower), AIC(bestFitPower), BIC(bestFitPower), PRESS(bestFitPower))
+# Make a summary table for the model selection criteria values
+ms_summary <- data.frame(cri1, cri2, cri3)
+rownames(ms_summary) <- c("R_squared", "Adjusted_R_squared", "Mallows' Cp", "AIC", "BIC", "PRESS")
+colnames(ms_summary) <- c("Main Effect Model", "Interaction Model", "Power Model")
+kable(ms_summary)
+```
+
+Observe from the above table, the bestFitPower model has the highest $R^2$ and $R^2_{adj}$, and the lowest AIC, BIC and PRESS. Therefore, we will choose bestFitPower as our final model.
+
+The following is a summary of the final model for predicting rental bike count.
+```{r}
+final_model = bestFitPower
+summary(final_model)
+```
+Observe that the p-value for F-statistic is less than $2.2\times10^{-16}$. Since it is much smaller than $0.01$, we reject the null hypothesis that all the coefficients are 0 with $99\%$ confidence. Here is the top 15 significant predictors from our final model (from left to right):
+```{r message=FALSE, echo=FALSE}
+# Make a summary table for the p-value for t-statistics of coefficients
+unsorted_data <- data.frame(summary(final_model)$coefficients[,4])
+pvalue_data <- data.frame(unsorted_data[order(unsorted_data[,1]),])
+pvalue_data <- c("6.023259e-272", "3.146954e-96", "4.902086e-73", "2.454797e-38", "3.184070e-30",
+                 "3.438887e-28", "6.036245e-28", "5.209009e-26", "7.468217e-24", "4.361069e-22",
+                 "7.029520e-22", "8.319585e-21", "1.012080e-17", "1.172648e-14", "1.483364e-12")
+coefficient_data <- c(884.8573, -380.9353, -475.2298, -156.5091, 28.1940, 27.4383,
+                     27.7041, 412.2179, 113.6037, 24.0440, -149.6061, 73.2413, 377.2912, 
+                     19.4463, -6.5916)
+pvalue_summary <- data.frame(pvalue_data, coefficient_data)
+colnames(pvalue_summary) <- c("p-value", "Coefficient")
+rownames(pvalue_summary) <- c("Functioning Day (Yes)", "Seasons (Winter)",
+"Rainfall^(1/2))", "Seasons (Spring)", "Hour 6pm:Temperature",
+"Hour 7pm:Temperature", "Hour 8pm:Temperature", "Hour 8am", 
+"Solar Radiation", "Hour 9pm:Temperature", "Seasons (Summer)", "Rainfall",
+"Hour 6pm", "Hour 22pm:Temperature", "Humidity")
+kable(pvalue_summary)
+```
+
+The above table indicates what predictors are significant in the final model. Here we give interpretation for some of the significant predictors. For example, the predictor Winter has a very small p-value $3.15\times10^{-96}$ and is therefore a significant predictor. We can see that the coefficient for Winter in the final model is $-380.94$. This means that the rental bike count will decrease by around 381 units on average when it is winter compared to other seasons while holding all other variables constant. This agrees with our common sense because people usually do not ride bikes in winter due to the bad weather conditions. Also, the predictors 8am and interaction terms between temperature and 6pm, 7pm, 8pm are all significant predictors. This means that rental bike count changes significantly at 8am. This agrees with the great jump of rental bike count at 8am in the correlation plot of rental bike count and hour in EDA section. The coefficient of this time spot is $412.22$. This means the rental bike count will increase by around 412 units on average when it is 8am compared to other hour while holding all other variables constant. The fact that the interaction terms between temperature and 6pm, 7pm and 8pm are significant means that there are significant slope differences for predictor temperature between the regression line for 6pm/7pm/8pm and 12am (base category) while holding all other variables constant. For instance, the coefficient for the interaction term between 6pm and temperature is $28.19$. This means that the slope of temperature is around 28.19 higher when it is 6pm compared to 12am. The last example is Solar Radiation. It has a coefficient $113.60$ which means a unit increase in solar radiation will result in around 114 units increase in rental bike count nets of effect from $\text{solar}^\frac{1}{2}$ and all other variables.
+
+Also, notice that $\frac{1}{3}$ of the 15 significant predictors are interaction terms between temperature and hour. Notably, this aligns with the conclusions drawn from two papers on the same data, that hour and temperature are two of the most important predictors(@Ve_Cho_Park, @Ve_Cho).
+
+
+## Model Validation
+Here we use MSPR statistic to validate the model performance.
+```{r}
+pred.cv.out <- predict(final_model, valid_set)
+delta.cv.out <- valid_y - pred.cv.out
+n.star <- dim(valid_set)[1]
+MSPR <- sum((delta.cv.out)^2)/n.star
+validation_summary <- data.frame(MSPR, MSE_F)
+rownames(validation_summary) <- "Validation Statistics"
+colnames(validation_summary) <- c("MSPR", "MSE_F")
+kable(validation_summary)
+```
+
+Observe that MSPR is very close to MSE of the training model. This means that the model passed the validation test.
+
+## Model Diagnostics
+
+### Residual Diagnostics
+
+
+```{r message=FALSE, echo=FALSE}
+#Cook's Distance:
+p1 <- ols_plot_cooksd_chart(fitPower)
+#DIFFITS:
+p2 <- ols_plot_dffits(fitPower)
+#Standardized residual vs leverage:
+p3 <- ols_plot_resid_lev(fitPower)
+#Studentized deleted residual vs predicted values:
+p4 <- ols_plot_resid_stud_fit(fitPower)
+
+# ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+# TODO: Luke
+```
+
+### Remove influential points and retrain data
+
+```{r message=FALSE}
+inf_pts <- p2$data$obs[abs(p2$data$dbetas) > 0.2]
+mb_set_infpts_removed <- mb_set[-inf_pts,]
+
+fitPower_infpts_removed <- lm(formula = count ~ factor(hour) + temp + humid + solar  + rain + snow + factor(func) + factor(season) + factor(holiday)  + factor(weekday) + factor(hour):temp + I(snow^(1 / 2)) + I(rain^(1 / 2)), data = mb_set_infpts_removed)
+bestFitPowerInfptsRemoved <- stepAIC(fitPower_infpts_removed, direction = "both")
+print("Adjusted R_squared")
+summary(bestFitPowerInfptsRemoved)$adj.r.squared
+```
+After removing the influential points, the Adjusted_R_squared value of the model increases.
+
+### Check for Multicollinearity:
+
+```{r message=FALSE, echo=FALSE}
+VIF <- vif(fitPower)
+VIF
+```
+
+None of the VIF value are greater than 10 so there is no indication of serious multicollinearity. 
+
+### LINE assumptions:
+
+```{r message=FALSE, echo=FALSE}
+par(mfrow=c(2,2))
+plot(fitPower, which = c(1,2,3))
+plot(order(fitted(fitPower)), resid(fitPower), ylab = "Residuals", xlab = "Observation", main = "Residuals vs Observation")
+```
+ 
+1. The residuals vs fitted plot does not look like a random scatter with mean around 0, so the linearity assumption is violated
+2. Based on the Normal Q-Q plot, the points at the tails do not closely adhere to the y=x line, so the normality assumption is violated
+3. On the scale-location plot, the red line is not horizontal and has an uneven spread of residuals, so the constant variance assumption is violated.
+4. From the residuals vs observation plot, there is not deviate pattern, so the independent error term assumption is satisfied.
+
+
+# Conclusion
+After delving through multiple models to find the one with the best predicting power for bike rentals, we land on our final model which includes square root, interaction and main effect covariates. Three insignificant predictors that were removed from this model were temperature, wind, and visibility. Three significant predictors were functioning day, seasons (notably winter), and hour (notably 8am and 6pm). Our final model had an adjusted $R^2$, or prediction power, of .74 before removing influential and outlying points and .82 after.
+
+For instance, on an average day in Seoul, the population will rent 780 more bikes on a functioning day than a non-functioning day, 380 less bikes on a Winter day than a Fall day, and 412 more bikes at 8am than midnight. This is important because during peak times and seasons, the government can provide additional bikes to meet the city’s exact need, and off-peak hours are perfect for bike repairs and maintenance.
+
+One challenge faced is the fact the data is chronological so there is some time dependency among the data points which breaks our independent assumption for regression modeling. Additionally, the 12th day of each month was missing data points and imputing these could have led to a better model. Also, a few of the LINE assumptions were violated and using weighted least squares or boxcox transformation could have fixed these.
+
+Looking forward, possible future directions would be modelling province, district, or even station specific data, so the predictions would be more useful for supply and demand. Additionally, because the data is dependent on time per se, we could use time series analysis (models such as ARIMA and SARIMA) to identify temporal patterns. 
+
